@@ -1,0 +1,9 @@
+# modelos e bibliotecas geradas (grandes demais para o git)
+*.llamafile
+*.gguf
+*.so
+*.part
+__pycache__/
+# material temporário da demonstração
+demo/tmp/
+*.cast

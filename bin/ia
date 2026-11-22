@@ -1,0 +1,646 @@
+#!/usr/bin/env python3
+"""ia - pergunte a um modelo local pelo terminal.
+
+Uso:
+  ia "quanto é 3 mais 3"
+  cat arquivo.txt | ia "resuma isso"
+  ia -p "quanto é 17% de 340?"       raciocina antes (mais lento, acerta mais)
+  ia <atalho> [argumentos]            veja: ia atalhos
+
+Atalhos:
+  ia commit              sugere a mensagem de commit do git diff --staged
+  ia log [serviço]       explica os erros recentes do sistema (journalctl)
+  ia cmd "pedido"        gera um comando e pergunta se deve executar
+  ia explica "comando"   explica um comando parte por parte
+  ia erro                explica o último comando que falhou
+  ia resumo < arquivo    resumo em tópicos
+  ia traduz "texto"      traduz português <-> inglês
+  ia corrige < texto     corrige o português
+
+Opções:
+  -p, --pensar  liga o raciocínio: mais lento, mas acerta mais em lógica e contas
+  --status      mostra se o servidor está rodando
+  --parar       encerra o servidor do modelo (libera a GPU)
+  --log         mostra o fim do log do servidor
+  --config      mostra a configuração em uso e onde ficam os arquivos
+  --ajuda       mostra esta ajuda
+
+Arquivos:
+  ~/.config/ia/config.ini          configuração
+  ~/.config/ia/atalhos.ini         atalhos (edite ou crie os seus)
+  ~/.config/ia/ia.bash             gancho do bash para o 'ia erro'
+  ~/.local/share/ia/modelos/       modelos e ggml-cuda.so
+  ~/.local/state/ia/               PID e log do servidor, último erro
+"""
+import configparser
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+HOME = os.path.expanduser("~")
+XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME", f"{HOME}/.config")
+XDG_DATA = os.environ.get("XDG_DATA_HOME", f"{HOME}/.local/share")
+XDG_STATE = os.environ.get("XDG_STATE_HOME", f"{HOME}/.local/state")
+
+CONFIG_FILE = os.path.join(XDG_CONFIG, "ia", "config.ini")
+ATALHOS_FILE = os.path.join(XDG_CONFIG, "ia", "atalhos.ini")
+ESTADO = os.path.join(XDG_STATE, "ia")
+PIDFILE = os.path.join(ESTADO, "servidor.pid")
+LOGFILE = os.path.join(ESTADO, "servidor.log")
+ULTIMO_ERRO = os.path.join(ESTADO, "ultimo_erro")
+
+PADRAO = {
+    "modelo": os.path.join(XDG_DATA, "ia", "modelos", "Qwen3.5-2B-Q8_0.llamafile"),
+    "executavel": os.path.join(XDG_DATA, "ia", "modelos", "llamafile"),
+    "porta": "8085",
+    "gpu": "nvidia",
+    "contexto": "16384",
+    "temperatura": "0.3",
+    "sistema": (
+        "Você é um assistente de terminal. Responda em português do Brasil, "
+        "de forma direta e curta, sem rodeios. Se a pergunta for simples, "
+        "responda só o resultado. Quando receber um conteúdo, use-o para responder."
+    ),
+}
+
+# Atalhos de fábrica. ~/.config/ia/atalhos.ini sobrescreve ou acrescenta.
+# Chaves: descricao, sistema, pedido, entrada (texto | comando | ultimo_erro),
+# comando (bash; argumentos em $1, $2, $@), verificar + verificar_erro,
+# verificar_vazio, pensar (sim/nao), acao (nenhuma | executar | commit),
+# cortar (inicio/fim: que lado manter quando o conteúdo é grande demais).
+ATALHOS_PADRAO = r"""
+[commit]
+descricao = sugere a mensagem de commit das mudanças no stage (git add)
+entrada = comando
+verificar = git rev-parse --is-inside-work-tree >/dev/null 2>&1 && ! git diff --staged --quiet
+verificar_erro = nada no stage: rode 'git add' antes (ou não é um repositório git)
+comando = echo "MUDANÇAS A DESCREVER:"; git diff --staged --stat; echo; git diff --staged; echo; echo "---"; echo "Títulos de commits ANTIGOS, só como referência de idioma e estilo (NÃO repita nenhum):"; git log --format='- %s' -5 2>/dev/null
+pedido = Escreva a mensagem de commit que descreve as MUDANÇAS do diff abaixo.
+sistema = Você escreve mensagens de commit no padrão Conventional Commits
+    (feat, fix, docs, chore, refactor, test, style, perf). A mensagem descreve
+    o que o diff muda: leia as linhas com + e -. Os commits antigos servem só
+    para copiar o idioma e o estilo, nunca o conteúdo. Responda só com a
+    mensagem: um título de até 72 caracteres e, se necessário, uma linha em
+    branco e um corpo curto em tópicos. Sem crases, sem markdown, sem comentários.
+acao = commit
+
+[log]
+descricao = explica os erros recentes do sistema; 'ia log nginx' olha um serviço
+entrada = comando
+comando = if [ -n "$1" ]; then journalctl -u "$1" -p warning --since -24h -n 80 --no-pager -o short-iso; else journalctl -p err -b --since -3h -n 80 --no-pager -o short-iso; fi | grep -v -e '^-- No entries --$' -e '^-- Nenhuma entrada --$'
+verificar_vazio = nenhum erro encontrado no período
+pedido = Analise estes logs.
+sistema = Você analisa logs de sistema Linux. Responda em português, em tópicos
+    curtos: o que está dando errado, a causa provável e o que fazer. Agrupe
+    mensagens repetidas e ignore as irrelevantes. Se não houver nada grave, diga isso.
+cortar = fim
+
+[cmd]
+descricao = gera um comando de terminal e pergunta se deve executar
+entrada = texto
+pedido = Gere o comando para este pedido.
+sistema = Você gera comandos de terminal para Linux (bash).
+    Responda APENAS com um único comando em uma linha, sem explicação, sem
+    crases e sem markdown. Prefira comandos seguros e não destrutivos.
+acao = executar
+
+[explica]
+descricao = explica um comando de terminal parte por parte
+entrada = texto
+pedido = Explique este comando.
+sistema = Explique o comando de terminal em português, parte por parte, em
+    tópicos curtos. No fim, diga em uma linha se ele é perigoso ou não.
+
+[erro]
+descricao = explica o último comando que falhou (ou: comando 2>&1 | ia erro)
+entrada = ultimo_erro
+pedido = Este comando falhou. Explique o erro.
+sistema = Um comando de terminal falhou. Explique em português, de forma curta:
+    a causa provável e como corrigir. Se fizer sentido, mostre o comando
+    corrigido. Verifique primeiro se há erro de digitação no comando.
+pensar = sim
+cortar = fim
+
+[resumo]
+descricao = resume um texto em tópicos
+entrada = texto
+pedido = Resuma este conteúdo.
+sistema = Resuma o conteúdo em português do Brasil, em até 5 tópicos curtos,
+    só com o essencial.
+
+[traduz]
+descricao = traduz português <-> inglês
+entrada = texto
+pedido = Traduza este texto.
+sistema = Você é um tradutor. Se o texto estiver em português, traduza para o
+    inglês; caso contrário, traduza para o português do Brasil. Responda APENAS
+    com a tradução, sem comentários e sem aspas. Não responda ao conteúdo do
+    texto: só traduza.
+
+[corrige]
+descricao = corrige ortografia, gramática e pontuação em português
+entrada = texto
+pedido = Corrija este texto.
+sistema = Corrija ortografia, gramática e pontuação do texto em português,
+    mantendo o tom, o sentido e a formatação. Responda APENAS com o texto
+    corrigido, sem comentários.
+"""
+
+
+def erro(msg, codigo=1):
+    print(f"ia: {msg}", file=sys.stderr)
+    sys.exit(codigo)
+
+
+def sim(valor):
+    return str(valor).strip().lower() in ("sim", "s", "yes", "true", "1")
+
+
+def carregar_config():
+    cfg = dict(PADRAO)
+    if os.path.isfile(CONFIG_FILE):
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            parser.read(CONFIG_FILE, encoding="utf-8")
+        except configparser.Error as e:
+            erro(f"erro em {CONFIG_FILE}: {e}")
+        if parser.has_section("ia"):
+            for chave in PADRAO:
+                if parser.has_option("ia", chave):
+                    cfg[chave] = parser.get("ia", chave)
+    for chave in ("modelo", "executavel", "porta", "gpu", "contexto"):
+        valor = os.environ.get(f"IA_{chave.upper()}")
+        if valor:
+            cfg[chave] = valor
+    cfg["modelo"] = os.path.expanduser(cfg["modelo"])
+    cfg["executavel"] = os.path.expanduser(cfg["executavel"])
+    cfg["sistema"] = " ".join(cfg["sistema"].split())
+    try:
+        cfg["porta"] = int(cfg["porta"])
+        cfg["contexto"] = int(cfg["contexto"])
+        cfg["temperatura"] = float(cfg["temperatura"])
+    except ValueError as e:
+        erro(f"valor inválido na configuração: {e}")
+    if cfg["gpu"] not in ("nvidia", "disable"):
+        erro("gpu deve ser 'nvidia' ou 'disable'")
+    return cfg
+
+
+def carregar_atalhos():
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.read_string(ATALHOS_PADRAO)
+    if os.path.isfile(ATALHOS_FILE):
+        try:
+            parser.read(ATALHOS_FILE, encoding="utf-8")
+        except configparser.Error as e:
+            erro(f"erro em {ATALHOS_FILE}: {e}")
+    return {nome: dict(parser.items(nome)) for nome in parser.sections()}
+
+
+CFG = carregar_config()
+BASE = f"http://127.0.0.1:{CFG['porta']}"
+# Limite de caracteres do conteúdo enviado (~3 caracteres por token, com folga).
+MAX_CHARS = int(CFG["contexto"] * 2.4)
+
+
+# ---------------------------------------------------------------- servidor
+
+def servidor_ok():
+    try:
+        with urllib.request.urlopen(f"{BASE}/health", timeout=1) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def ler_pid():
+    try:
+        with open(PIDFILE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def comando_base():
+    """Monta o início do comando: um .llamafile roda sozinho; um .gguf roda
+    pelo llamafile configurado em 'executavel', com -m."""
+    modelo = CFG["modelo"]
+    if not os.path.isfile(modelo):
+        erro(f"modelo não encontrado: {modelo}\n    ajuste 'modelo' em {CONFIG_FILE}")
+    if modelo.endswith(".gguf"):
+        exe = CFG["executavel"]
+        if not os.path.isfile(exe):
+            erro(f"executável não encontrado: {exe}\n    ajuste 'executavel' em {CONFIG_FILE}")
+        # O .llamafile traz fixo nos argumentos embutidos o --mmproj (visão) do modelo
+        # dele, incompatível com outro GGUF. --mmproj "" sobrescreve; --no-mmproj evita busca automática.
+        # llamafile é um binário APE: o kernel não o executa direto, o sh sim.
+        return exe, ["sh", exe, "-m", modelo, "--mmproj", "", "--no-mmproj"]
+    return modelo, ["sh", modelo]
+
+
+def iniciar_servidor():
+    exe, base = comando_base()
+    os.makedirs(ESTADO, mode=0o700, exist_ok=True)
+    usa_gpu = CFG["gpu"] != "disable"
+    if usa_gpu and not os.path.isfile(os.path.join(os.path.dirname(exe), "ggml-cuda.so")):
+        print("ia: aviso: ggml-cuda.so não está ao lado do executável; a GPU pode falhar",
+              file=sys.stderr)
+    cmd = base + [
+        "--server", "--host", "127.0.0.1", "--port", str(CFG["porta"]),
+        "--gpu", CFG["gpu"], "-ngl", "999" if usa_gpu else "0",
+        "-c", str(CFG["contexto"]), "-rea", "off", "--nologo",
+    ]
+    with open(LOGFILE, "w") as log:
+        p = subprocess.Popen(
+            cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+            cwd=os.path.dirname(exe), start_new_session=True,
+        )
+    with open(PIDFILE, "w") as f:
+        f.write(str(p.pid))
+    mostrar = sys.stderr.isatty()
+    if mostrar:
+        print("ia: carregando o modelo...", file=sys.stderr, end="", flush=True)
+    for _ in range(240):
+        if servidor_ok():
+            if mostrar:
+                print("\r\033[K", file=sys.stderr, end="", flush=True)
+            return
+        if p.poll() is not None:
+            if mostrar:
+                print(file=sys.stderr)
+            erro("o servidor falhou ao iniciar; veja: ia --log")
+        time.sleep(0.5)
+    erro("o servidor demorou demais para iniciar; veja: ia --log")
+
+
+def parar():
+    pid = ler_pid()
+    if not pid:
+        print("ia: servidor não está rodando")
+        return
+    try:
+        pgid = os.getpgid(pid)
+        os.killpg(pgid, signal.SIGTERM)
+        for _ in range(50):
+            time.sleep(0.2)
+            os.killpg(pgid, 0)
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        os.remove(PIDFILE)
+    except OSError:
+        pass
+    print("ia: servidor encerrado")
+
+
+def mostrar_log():
+    try:
+        with open(LOGFILE, errors="replace") as f:
+            linhas = f.readlines()
+    except OSError:
+        erro("ainda não há log do servidor")
+    sys.stdout.writelines(linhas[-40:])
+
+
+def mostrar_config():
+    print(f"config:   {CONFIG_FILE}{'' if os.path.isfile(CONFIG_FILE) else ' (não existe, usando padrões)'}")
+    print(f"atalhos:  {ATALHOS_FILE}{'' if os.path.isfile(ATALHOS_FILE) else ' (não existe, usando os de fábrica)'}")
+    print(f"modelo:   {CFG['modelo']}")
+    if CFG["modelo"].endswith(".gguf"):
+        print(f"executor: {CFG['executavel']}")
+    print(f"porta:    {CFG['porta']} (127.0.0.1)")
+    print(f"gpu:      {CFG['gpu']}")
+    print(f"contexto: {CFG['contexto']} tokens")
+    print(f"estado:   {ESTADO}")
+    print(f"servidor: {'rodando' if servidor_ok() else 'parado'}")
+
+
+# ---------------------------------------------------------------- modelo
+
+def perguntar(mensagem, pensar=False, sistema=None, mostrar=True):
+    """Envia a pergunta. Com mostrar=True imprime a resposta enquanto chega.
+    Devolve o texto completo."""
+    if not servidor_ok():
+        iniciar_servidor()
+    pedido = {
+        "messages": [
+            {"role": "system", "content": sistema or CFG["sistema"]},
+            {"role": "user", "content": mensagem},
+        ],
+        "stream": True,
+        "temperature": CFG["temperatura"],
+    }
+    if pensar:
+        # Liga o <think> do Qwen só nesta pergunta; o servidor sobe com -rea off.
+        pedido["chat_template_kwargs"] = {"enable_thinking": True}
+        pedido["temperature"] = max(CFG["temperatura"], 0.6)
+    req = urllib.request.Request(
+        f"{BASE}/v1/chat/completions", data=json.dumps(pedido).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=600)
+    except urllib.error.HTTPError as e:
+        detalhe = e.read().decode(errors="replace")
+        if "exceed" in detalhe or "context" in detalhe:
+            erro(f"o texto é grande demais para o contexto do modelo ({CFG['contexto']} tokens)")
+        erro(f"erro do servidor: {detalhe[:300]}")
+    except urllib.error.URLError as e:
+        erro(f"não consegui falar com o servidor: {e.reason}")
+
+    completo = []
+    aviso = sys.stderr.isatty() and (pensar or not mostrar)
+    if aviso:
+        print("ia: pensando..." if pensar else "ia: gerando...",
+              file=sys.stderr, end="", flush=True)
+    for linha in resp:
+        linha = linha.decode(errors="replace").strip()
+        if not linha.startswith("data:"):
+            continue
+        dado = linha[5:].strip()
+        if dado == "[DONE]":
+            break
+        try:
+            delta = json.loads(dado)["choices"][0]["delta"]
+        except (KeyError, IndexError, json.JSONDecodeError):
+            continue
+        texto = delta.get("content") or ""
+        if texto and not completo:
+            texto = texto.lstrip()
+        if not texto:
+            continue
+        completo.append(texto)
+        if mostrar:
+            if aviso:
+                print("\r\033[K", file=sys.stderr, end="", flush=True)
+                aviso = False
+            sys.stdout.write(texto)
+            sys.stdout.flush()
+    if aviso:
+        print("\r\033[K", file=sys.stderr, end="", flush=True)
+    resposta = "".join(completo)
+    if mostrar and not resposta.endswith("\n"):
+        sys.stdout.write("\n")
+    return resposta
+
+
+# ---------------------------------------------------------------- atalhos
+
+def ler_stdin():
+    return "" if sys.stdin.isatty() else sys.stdin.read().strip()
+
+
+def cortar(texto, lado="inicio"):
+    if len(texto) <= MAX_CHARS:
+        return texto
+    if lado == "fim":
+        return "[... início cortado ...]\n" + texto[-MAX_CHARS:]
+    return texto[:MAX_CHARS] + "\n[... resto cortado ...]"
+
+
+def tty_perguntar(texto):
+    """Pergunta ao usuário pelo terminal, mesmo se o stdin for um pipe.
+    Devolve None se não houver terminal."""
+    try:
+        with open("/dev/tty", "r+") as tty:
+            tty.write(texto)
+            tty.flush()
+            return tty.readline().strip().lower()
+    except OSError:
+        return None
+
+
+def rodar_bash(comando, args=(), timeout=60):
+    try:
+        r = subprocess.run(
+            ["bash", "-c", comando, "ia", *args], capture_output=True,
+            text=True, errors="replace", timeout=timeout, stdin=subprocess.DEVNULL,
+        )
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except subprocess.TimeoutExpired as e:
+        def txt(x):
+            return x.decode(errors="replace") if isinstance(x, bytes) else (x or "")
+        return 124, (txt(e.stdout) + txt(e.stderr)).strip() + f"\n[interrompido após {timeout}s]"
+
+
+def ler_ultimo_erro():
+    try:
+        with open(ULTIMO_ERRO) as f:
+            codigo, comando = f.read().split("\n", 1)
+        return codigo.strip(), comando.strip()
+    except (OSError, ValueError):
+        return None
+
+
+def entrada_ultimo_erro():
+    """Conteúdo do 'ia erro': a saída que veio por pipe, ou o último comando
+    registrado pelo gancho do bash (rodando de novo, se o usuário quiser)."""
+    canal = ler_stdin()
+    if canal:
+        return f"Saída do comando:\n{canal}"
+
+    registro = ler_ultimo_erro()
+    if not registro:
+        erro("nenhum comando com erro registrado.\n"
+             "    ative o registro com:  echo 'source ~/.config/ia/ia.bash' >> ~/.bashrc\n"
+             "    ou envie a saída:      comando 2>&1 | ia erro")
+    codigo, comando = registro
+    print(f"ia: último comando com erro (código {codigo}): {comando}", file=sys.stderr)
+    resp = tty_perguntar("ia: rodar de novo para capturar a mensagem de erro? [s/N] ")
+    if resp in ("s", "sim"):
+        codigo, saida = rodar_bash(comando, timeout=60)
+        return f"Comando: {comando}\nCódigo de saída: {codigo}\nSaída:\n{saida}"
+    return f"Comando: {comando}\nCódigo de saída: {codigo}\n(sem a saída do comando)"
+
+
+def limpar_resposta(texto):
+    """Tira cercas de código e crases que o modelo às vezes coloca."""
+    texto = re.sub(r"^```[a-zA-Z]*\s*\n?", "", texto.strip())
+    texto = re.sub(r"\n?```\s*$", "", texto).strip()
+    if texto.startswith("`") and texto.endswith("`") and "\n" not in texto:
+        texto = texto.strip("`")
+    return texto.strip()
+
+
+def acao_executar(resposta):
+    linhas = limpar_resposta(resposta).splitlines()
+    comando = re.sub(r"^\$\s+", "", linhas[0].strip()) if linhas else ""
+    if not comando:
+        erro("o modelo não devolveu um comando")
+    print(comando)
+    resp = tty_perguntar("ia: executar? [s]im, [e]ditar, [N]ão: ")
+    if resp in ("e", "editar"):
+        comando = editar_linha(comando)
+        if not comando:
+            return
+    elif resp not in ("s", "sim"):
+        return
+    print(f"ia: executando: {comando}", file=sys.stderr)
+    with open("/dev/tty") as tty:
+        sys.exit(subprocess.call(["bash", "-c", comando], stdin=tty))
+
+
+def editar_linha(texto):
+    """Mostra o texto já preenchido para o usuário editar (com readline)."""
+    try:
+        import readline
+    except ImportError:
+        readline = None
+    try:
+        tty = open("/dev/tty")
+    except OSError:
+        return None
+    stdin_antigo, stdout_antigo = sys.stdin, sys.stdout
+    try:
+        sys.stdin = tty
+        sys.stdout = open("/dev/tty", "w")
+        if readline:
+            readline.set_startup_hook(lambda: readline.insert_text(texto))
+        return input("$ ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    finally:
+        if readline:
+            readline.set_startup_hook()
+        sys.stdout.close()
+        sys.stdin, sys.stdout = stdin_antigo, stdout_antigo
+        tty.close()
+
+
+def acao_commit(resposta):
+    mensagem = limpar_resposta(resposta)
+    if not mensagem:
+        erro("o modelo não devolveu uma mensagem")
+    print(mensagem)
+    resp = tty_perguntar("\nia: [c]ommitar, [e]ditar antes, [S]air: ")
+    if resp not in ("c", "e"):
+        return
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        f.write(mensagem + "\n")
+        caminho = f.name
+    try:
+        cmd = ["git", "commit", "-F", caminho] + (["-e"] if resp == "e" else [])
+        with open("/dev/tty") as tty:
+            codigo = subprocess.call(cmd, stdin=tty)
+    finally:
+        os.remove(caminho)
+    sys.exit(codigo)
+
+
+def rodar_atalho(nome, at, args, pensar):
+    entrada = at.get("entrada", "texto")
+    if at.get("verificar"):
+        codigo, _ = rodar_bash(at["verificar"], args)
+        if codigo != 0:
+            erro(at.get("verificar_erro", "verificação do atalho falhou"))
+
+    extra = ""
+    if entrada == "comando":
+        if not at.get("comando"):
+            erro(f"atalho '{nome}' sem a chave 'comando'")
+        _, conteudo = rodar_bash(at["comando"], args, timeout=120)
+    elif entrada == "ultimo_erro":
+        conteudo = entrada_ultimo_erro()
+        extra = " ".join(args)
+    else:
+        canal = ler_stdin()
+        texto = " ".join(args).strip()
+        if canal:
+            conteudo, extra = canal, texto
+        else:
+            conteudo = texto
+    if not conteudo.strip():
+        if at.get("verificar_vazio"):
+            print(f"ia: {at['verificar_vazio']}")
+            return
+        erro(f'nada para processar. uso: ia {nome} "texto"  ou  ... | ia {nome}', 2)
+
+    conteudo = cortar(conteudo, at.get("cortar", "inicio"))
+    mensagem = f"{at.get('pedido', '').strip()}\n\n<<<\n{conteudo}\n>>>"
+    if extra:
+        mensagem += f"\n\nInstrução adicional: {extra}"
+    sistema = " ".join(at.get("sistema", CFG["sistema"]).split())
+    pensar = pensar or sim(at.get("pensar", "nao"))
+    acao = at.get("acao", "nenhuma")
+
+    resposta = perguntar(mensagem, pensar, sistema, mostrar=(acao == "nenhuma"))
+    if acao == "executar":
+        acao_executar(resposta)
+    elif acao == "commit":
+        acao_commit(resposta)
+
+
+def listar_atalhos(atalhos, so_nomes=False):
+    if so_nomes:
+        print("\n".join(atalhos))
+        return
+    largura = max(len(n) for n in atalhos)
+    for nome, at in atalhos.items():
+        print(f"  {nome:<{largura}}  {at.get('descricao', '')}")
+    print(f"\nPersonalize em {ATALHOS_FILE}")
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    args = sys.argv[1:]
+    acoes = {
+        "--parar": parar,
+        "--log": mostrar_log,
+        "--config": mostrar_config,
+        "--status": lambda: print("rodando" if servidor_ok() else "parado",
+                                  f"(porta {CFG['porta']})"),
+    }
+    if args and args[0] in ("-h", "--help", "--ajuda"):
+        print(__doc__.strip())
+        return
+    if args and args[0] in acoes:
+        acoes[args[0]]()
+        return
+
+    pensar = False
+    while args and args[0] in ("-p", "--pensar"):
+        pensar = True
+        args = args[1:]
+
+    atalhos = carregar_atalhos()
+    try:
+        if args and args[0] in ("atalhos", "--atalhos"):
+            listar_atalhos(atalhos)
+            return
+        if args and args[0] == "--lista-atalhos":
+            listar_atalhos(atalhos, so_nomes=True)
+            return
+        if args and args[0] in atalhos:
+            rodar_atalho(args[0], atalhos[args[0]], args[1:], pensar)
+            return
+
+        pergunta = " ".join(args).strip()
+        entrada = ler_stdin()
+        if not pergunta and not entrada:
+            erro('uso: ia "sua pergunta"   (ou: cat arquivo | ia "pergunta"; ia --ajuda)', 2)
+        if pergunta and entrada:
+            mensagem = f"Conteúdo recebido:\n<<<\n{cortar(entrada)}\n>>>\n\n{pergunta}"
+        else:
+            mensagem = pergunta or cortar(entrada)
+        perguntar(mensagem, pensar)
+    except KeyboardInterrupt:
+        sys.stdout.write("\n")
+        sys.exit(130)
+    except BrokenPipeError:
+        pass
+
+
+if __name__ == "__main__":
+    main()
